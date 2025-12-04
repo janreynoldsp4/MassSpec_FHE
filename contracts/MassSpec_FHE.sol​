@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+
+contract MassSpec_FHE is SepoliaConfig {
+    struct EncryptedSpectrum {
+        uint256 spectrumId;
+        address researcher;
+        euint32[] encryptedMZValues;
+        euint32[] encryptedIntensities;
+        euint32 encryptedSampleType;
+        uint256 timestamp;
+    }
+
+    struct AnalysisResult {
+        string compoundIdentified;
+        string concentrationLevel;
+        string purityEstimate;
+        bool isRevealed;
+    }
+
+    uint256 public spectrumCount;
+    mapping(uint256 => EncryptedSpectrum) public spectra;
+    mapping(uint256 => AnalysisResult) public results;
+    mapping(uint256 => uint256) private requestToSpectrumId;
+
+    event SpectrumUploaded(uint256 indexed spectrumId, address indexed researcher);
+    event AnalysisRequested(uint256 indexed spectrumId);
+    event AnalysisCompleted(uint256 indexed spectrumId);
+
+    modifier onlyResearcher(uint256 spectrumId) {
+        require(msg.sender == spectra[spectrumId].researcher, "Not researcher");
+        _;
+    }
+
+    function uploadEncryptedSpectrum(
+        euint32[] memory mzValues,
+        euint32[] memory intensities,
+        euint32 sampleType
+    ) public {
+        require(mzValues.length == intensities.length, "Array length mismatch");
+        
+        spectrumCount += 1;
+        uint256 newId = spectrumCount;
+
+        spectra[newId] = EncryptedSpectrum({
+            spectrumId: newId,
+            researcher: msg.sender,
+            encryptedMZValues: mzValues,
+            encryptedIntensities: intensities,
+            encryptedSampleType: sampleType,
+            timestamp: block.timestamp
+        });
+
+        results[newId] = AnalysisResult({
+            compoundIdentified: "",
+            concentrationLevel: "",
+            purityEstimate: "",
+            isRevealed: false
+        });
+
+        emit SpectrumUploaded(newId, msg.sender);
+    }
+
+    function requestSpectrumAnalysis(uint256 spectrumId) public onlyResearcher(spectrumId) {
+        require(!results[spectrumId].isRevealed, "Already analyzed");
+
+        EncryptedSpectrum storage spectrum = spectra[spectrumId];
+        uint32 dataLength = uint32(spectrum.encryptedMZValues.length);
+        
+        bytes32[] memory ciphertexts = new bytes32[](dataLength * 2 + 1);
+        
+        for (uint i = 0; i < dataLength; i++) {
+            ciphertexts[i] = FHE.toBytes32(spectrum.encryptedMZValues[i]);
+            ciphertexts[dataLength + i] = FHE.toBytes32(spectrum.encryptedIntensities[i]);
+        }
+        ciphertexts[dataLength * 2] = FHE.toBytes32(spectrum.encryptedSampleType);
+
+        uint256 reqId = FHE.requestDecryption(ciphertexts, this.analyzeSpectrum.selector);
+        requestToSpectrumId[reqId] = spectrumId;
+
+        emit AnalysisRequested(spectrumId);
+    }
+
+    function analyzeSpectrum(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory proof
+    ) public {
+        uint256 spectrumId = requestToSpectrumId[requestId];
+        require(spectrumId != 0, "Invalid request");
+
+        AnalysisResult storage result = results[spectrumId];
+        require(!result.isRevealed, "Already analyzed");
+
+        FHE.checkSignatures(requestId, cleartexts, proof);
+
+        (uint32[] memory mzValues, 
+         uint32[] memory intensities, 
+         uint32 sampleType) = abi.decode(cleartexts, (uint32[], uint32[], uint32));
+        
+        (result.compoundIdentified,
+         result.concentrationLevel,
+         result.purityEstimate) = _identifyCompound(mzValues, intensities, sampleType);
+        
+        result.isRevealed = true;
+
+        emit AnalysisCompleted(spectrumId);
+    }
+
+    function _identifyCompound(
+        uint32[] memory mzValues,
+        uint32[] memory intensities,
+        uint32 sampleType
+    ) private pure returns (
+        string memory,
+        string memory,
+        string memory
+    ) {
+        string memory compound;
+        string memory concentration;
+        string memory purity;
+
+        // Simplified identification logic (in practice would use more complex algorithms)
+        uint32 basePeakIntensity = 0;
+        uint32 totalIntensity = 0;
+        
+        for (uint i = 0; i < intensities.length; i++) {
+            if (intensities[i] > basePeakIntensity) {
+                basePeakIntensity = intensities[i];
+            }
+            totalIntensity += intensities[i];
+        }
+
+        // Determine compound based on highest peak
+        if (basePeakIntensity > 1000) {
+            compound = "Caffeine";
+        } else if (basePeakIntensity > 500) {
+            compound = "Glucose";
+        } else {
+            compound = "Unknown";
+        }
+
+        // Determine concentration level
+        if (totalIntensity > 10000) {
+            concentration = "High";
+        } else if (totalIntensity > 5000) {
+            concentration = "Medium";
+        } else {
+            concentration = "Low";
+        }
+
+        // Determine purity estimate
+        uint32 numPeaks = 0;
+        for (uint i = 0; i < intensities.length; i++) {
+            if (intensities[i] > 100) {
+                numPeaks++;
+            }
+        }
+
+        if (numPeaks < 3) {
+            purity = "High Purity";
+        } else if (numPeaks < 6) {
+            purity = "Moderate Purity";
+        } else {
+            purity = "Low Purity";
+        }
+
+        return (compound, concentration, purity);
+    }
+
+    function getAnalysisResult(uint256 spectrumId) public view onlyResearcher(spectrumId) returns (
+        string memory compound,
+        string memory concentration,
+        string memory purity,
+        bool isRevealed
+    ) {
+        AnalysisResult storage r = results[spectrumId];
+        return (r.compoundIdentified, r.concentrationLevel, r.purityEstimate, r.isRevealed);
+    }
+
+    function calculateEncryptedTotalIntensity(euint32[] memory intensities) public pure returns (euint32) {
+        require(intensities.length > 0, "Empty array");
+        
+        euint32 total = intensities[0];
+        for (uint i = 1; i < intensities.length; i++) {
+            total = FHE.add(total, intensities[i]);
+        }
+        return total;
+    }
+
+    function getSpectrumTimestamp(uint256 spectrumId) public view onlyResearcher(spectrumId) returns (uint256) {
+        return spectra[spectrumId].timestamp;
+    }
+}
